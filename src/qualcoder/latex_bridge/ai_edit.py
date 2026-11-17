@@ -20,7 +20,7 @@ from . import core, prompts
 logger = logging.getLogger(__name__)
 
 MODES = [
-    ("Glätten (fester Prompt)", "smooth"),
+    ("Glätten nach Regeln", "smooth"),
     ("Zusammenfassen", "summarize"),
     ("Eigene Anweisung (Text ändern)", "edit"),
     ("Überall markieren (Code setzen)", "code"),
@@ -42,25 +42,36 @@ def ask_model(app, system: str, text: str) -> str:
     return str(getattr(answer, "content", answer))
 
 
-def propose(app, mode: str, instruction: str, text: str, start: int, end: int,
-            existing: list[tuple[int, int]], signals=None) -> list[dict]:
-    """The proposals for [start, end) of text, chunk by chunk. Runs on a worker thread."""
-    changes = []
-    for c0, c1 in core.chunks(text, start, end):
-        if signals is not None:
-            signals.progress.emit(f"Zeile {core.line_of(text, c0)} …")
-        if mode == "code":
-            quotes = core.parse_quotes(ask_model(app, prompts.CODING.format(instruction=instruction), text[c0:c1]))
-            changes += core.coding_changes(text, quotes, c0, c1, existing)
-            continue
-        system = {"smooth": prompts.SMOOTHING, "summarize": prompts.SUMMARIZE}.get(mode) or \
-            prompts.EDIT.format(instruction=instruction)
-        revised = ask_model(app, system, text[c0:c1])
-        # Models often drop the chunk's trailing line break; keep it so lines do not merge.
-        if text[c0:c1].endswith("\n") and not revised.endswith("\n"):
-            revised += "\n"
-        changes += core.diff_changes(text[c0:c1], revised, c0)
-    return changes
+def propose(app, mode: str, instruction: str, jobs: list[dict], rules: list[str],
+            signals=None) -> tuple[list[dict], int]:
+    """(changes, dropped) for every job {fid, name, text, start, end, existing}, chunk by chunk.
+
+    Runs on a worker thread. Smoothing asks for single edits tied to a rule; the other text modes
+    ask for the revised text and diff it."""
+    changes, dropped = [], 0
+    for job in jobs:
+        text = job["text"]
+        for c0, c1 in core.chunks(text, job["start"], job["end"]):
+            if signals is not None:
+                signals.progress.emit(f"{job['name']}, Zeile {core.line_of(text, c0)} …")
+            if mode == "code":
+                quotes = core.parse_quotes(ask_model(app, prompts.CODING.format(instruction=instruction), text[c0:c1]))
+                found = core.coding_changes(text, quotes, c0, c1, job["existing"])
+            elif mode == "smooth":
+                edits = core.parse_edits(ask_model(app, prompts.smoothing(rules), text[c0:c1]))
+                found, lost = core.rule_changes(text, edits, c0, c1, rules)
+                dropped += lost
+            else:
+                system = prompts.SUMMARIZE if mode == "summarize" else prompts.EDIT.format(instruction=instruction)
+                revised = ask_model(app, system, text[c0:c1])
+                # Models often drop the chunk's trailing line break; keep it so lines do not merge.
+                if text[c0:c1].endswith("\n") and not revised.endswith("\n"):
+                    revised += "\n"
+                found = core.diff_changes(text[c0:c1], revised, c0)
+            for change in found:
+                change.update(fid=job["fid"], file=job["name"], line=core.line_of(text, change["pos0"]))
+            changes += found
+    return changes, dropped
 
 
 def apply_text_changes(app, fid: int, changes: list[dict]) -> None:
@@ -99,28 +110,41 @@ def apply_codings(app, fid: int, cid: int, changes: list[dict], memo: str) -> No
 
 
 class AiEditDialog(QtWidgets.QDialog):
-    """Instruction → proposal as a diff → accept single changes or all → applied, backed up, logged."""
+    """Instruction → proposal as a diff → accept single changes or all → applied, backed up, logged.
+
+    Works on one or several files; smoothing follows the project's own rules and tags every change
+    with the rule it applies. Double-clicking a proposal scrolls the diff to it and highlights it."""
 
     def __init__(self, app, fid: int | None = None, start: int | None = None, end: int | None = None,
                  parent=None):
         super().__init__(parent)
         self.app = app
-        self.text, self.start, self.end, self.fid = "", 0, 0, None
+        self.texts: dict[int, str] = {}
+        self.names: dict[int, str] = {}
+        self.scopes: dict[int, tuple[int, int]] = {}
         self.changes: list[dict] = []
-        self.selection = (fid, start, end) if fid is not None and start is not None and end is not None and end > start else None
+        self.shown_fid: int | None = None
+        self.focus: int | None = None
+        self.selection = (fid, start, end) if None not in (fid, start, end) and end > start else None
         self.setWindowTitle(_("AI edit with diff review"))
-        self.resize(1000, 700)
+        self.resize(1100, 800)
 
-        self.files = QtWidgets.QComboBox()
+        self.files = QtWidgets.QListWidget()
+        self.files.setMaximumHeight(110)
         for sid, name in app.conn.execute("select id, name from source where fulltext is not null "
                                           "and lower(ifnull(mediapath, '')) not like '%.pdf' order by name"):
-            self.files.addItem(name, sid)
-        if fid is not None:
-            self.files.setCurrentIndex(max(0, self.files.findData(fid)))
+            item = QtWidgets.QListWidgetItem(name)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if sid == fid else QtCore.Qt.CheckState.Unchecked)
+            self.files.addItem(item)
         self.scope = QtWidgets.QLabel()
         self.mode = QtWidgets.QComboBox()
         for label, key in MODES:
             self.mode.addItem(label, key)
+        self.rules = QtWidgets.QPlainTextEdit("\n".join(core.load_rules(app.project_path, prompts.DEFAULT_RULES)))
+        self.rules.setMaximumHeight(120)
+        self.rules.setToolTip(_("One smoothing rule per line. They are numbered R1, R2, … and saved with the project."))
         self.code = QtWidgets.QComboBox()
         for cid, name in app.conn.execute("select cid, name from code_name order by name"):
             self.code.addItem(name, cid)
@@ -132,25 +156,36 @@ class AiEditDialog(QtWidgets.QDialog):
         self.summary = QtWidgets.QLabel()
         self.summary.setWordWrap(True)
         self.list = QtWidgets.QListWidget()
+        self.list.setToolTip(_("Double-click: show the change in the diff"))
+        self.diff_title = QtWidgets.QLabel()
         self.diff = QtWidgets.QTextBrowser()
+        self.detail = QtWidgets.QLabel()
+        self.detail.setWordWrap(True)
         self.select_all = QtWidgets.QPushButton(_("Select all"))
         self.select_none = QtWidgets.QPushButton(_("Select none"))
         self.apply_button = QtWidgets.QPushButton(_("Apply selected"))
         self.apply_button.setEnabled(False)
 
         form = QtWidgets.QFormLayout()
-        form.addRow(_("File"), self.files)
+        form.addRow(_("Files"), self.files)
         form.addRow(_("Scope"), self.scope)
         form.addRow(_("Mode"), self.mode)
+        form.addRow(_("Smoothing rules"), self.rules)
         form.addRow(_("Code"), self.code)
         form.addRow(_("Instruction"), self.instruction)
         top = QtWidgets.QHBoxLayout()
         top.addWidget(self.model_label, 1)
         top.addWidget(self.request_button)
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.diff_title)
+        right_layout.addWidget(self.diff, 1)
+        right_layout.addWidget(self.detail)
         split = QtWidgets.QSplitter()
         split.addWidget(self.list)
-        split.addWidget(self.diff)
-        split.setSizes([350, 650])
+        split.addWidget(right)
+        split.setSizes([400, 700])
         buttons = QtWidgets.QHBoxLayout()
         for button in (self.select_all, self.select_none):
             buttons.addWidget(button)
@@ -163,38 +198,55 @@ class AiEditDialog(QtWidgets.QDialog):
         layout.addWidget(split, 1)
         layout.addLayout(buttons)
 
-        self.files.currentIndexChanged.connect(self.file_changed)
+        self.files.itemChanged.connect(self.files_changed)
         self.mode.currentIndexChanged.connect(self.mode_changed)
         self.request_button.clicked.connect(self.request)
         self.list.itemChanged.connect(self.refresh_diff)
+        self.list.currentRowChanged.connect(self.show_detail)
+        self.list.itemDoubleClicked.connect(lambda item: self.focus_change(self.list.row(item)))
         self.select_all.clicked.connect(lambda: self.check_all(True))
         self.select_none.clicked.connect(lambda: self.check_all(False))
         self.apply_button.clicked.connect(self.apply)
         self.mode_changed()
-        self.load_text()
+        self.load_texts()
 
     # ---------------------------------------------------------------- state
 
-    def load_text(self):
-        self.fid = self.files.currentData()
-        row = self.app.conn.execute("select fulltext from source where id=?", (self.fid,)).fetchone()
-        self.text = row[0] if row and row[0] else ""
-        if self.selection and self.selection[0] == self.fid:
-            self.start, self.end = self.selection[1], min(self.selection[2], len(self.text))
-            self.scope.setText(f"Markierung, Zeilen {core.line_of(self.text, self.start)}–{core.line_of(self.text, self.end)}")
+    def checked_fids(self) -> list[int]:
+        return [self.files.item(i).data(QtCore.Qt.ItemDataRole.UserRole) for i in range(self.files.count())
+                if self.files.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+
+    def load_texts(self):
+        """Fresh texts of the checked files; a selection from the coding window limits its own file."""
+        fids = self.checked_fids()
+        self.texts, self.names, self.scopes = {}, {}, {}
+        for fid in fids:
+            text, name = self.app.conn.execute("select ifnull(fulltext, ''), name from source where id=?", (fid,)).fetchone()
+            self.texts[fid], self.names[fid] = text, name
+            if self.selection and self.selection[0] == fid:
+                self.scopes[fid] = (self.selection[1], min(self.selection[2], len(text)))
+            else:
+                self.scopes[fid] = (0, len(text))
+        if len(fids) == 1 and self.selection and self.selection[0] == fids[0]:
+            start, end = self.scopes[fids[0]]
+            text = self.texts[fids[0]]
+            self.scope.setText(f"Markierung, Zeilen {core.line_of(text, start)}–{core.line_of(text, end)}")
         else:
-            self.start, self.end = 0, len(self.text)
-            self.scope.setText(f"Ganzes Transkript ({len(self.text)} Zeichen)")
+            self.scope.setText(f"{len(fids)} Datei(en), jeweils ganzes Transkript" if fids else _("No file checked"))
+        self.shown_fid = fids[0] if fids else None
         self.show_changes([])
 
-    def file_changed(self):
-        self.selection = None
-        self.load_text()
+    def files_changed(self):
+        self.load_texts()
 
     def mode_changed(self):
         key = self.mode.currentData()
         self.code.setEnabled(key == "code")
         self.instruction.setEnabled(key in ("edit", "code"))
+        self.rules.setEnabled(key == "smooth")
+
+    def current_rules(self) -> list[str]:
+        return core.parse_rules(self.rules.toPlainText())
 
     def selected(self) -> set[int]:
         return {i for i in range(self.list.count())
@@ -207,30 +259,74 @@ class AiEditDialog(QtWidgets.QDialog):
                 self.list.item(i).setCheckState(state)
         self.refresh_diff()
 
+    def show_result(self, result: tuple[list[dict], int]):
+        changes, dropped = result
+        self.show_changes(changes)
+        if dropped:
+            self.summary.setText(self.summary.text() + f" · {dropped} Vorschläge des Modells verworfen "
+                                 "(nicht im Text gefunden, überschneidend oder an einem Zeilenumbruch)")
+
     def show_changes(self, changes: list[dict]):
-        self.changes = changes
+        self.changes, self.focus = changes, None
         with QtCore.QSignalBlocker(self.list):
             self.list.clear()
             for c in changes:
                 old = c["old"].replace("\n", "⏎")
-                text = f"Z. {core.line_of(self.text, c['pos0'])} · {c['kind']}: "
+                text = f"{c.get('file', '')} · Z. {c.get('line', '?')} · {c['kind']}: "
                 text += old[:60] if c["kind"] == core.CODE_SET else f"„{old[:30]}“ → „{c['new'].replace(chr(10), '⏎')[:30]}“"
                 item = QtWidgets.QListWidgetItem(text)
+                item.setToolTip(c.get("reason") or "")
                 item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(QtCore.Qt.CheckState.Checked)
+                # A smoothing change without a valid rule is not what the rules asked for: opt-in only.
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked if c["kind"] == core.NO_RULE
+                                   else QtCore.Qt.CheckState.Checked)
                 self.list.addItem(item)
-        self.summary.setText(core.summary(self.text, changes) if changes else "")
+        self.summary.setText(core.summary(None, changes) if changes else "")
+        self.detail.setText("")
+        if changes:
+            self.shown_fid = changes[0]["fid"]
         self.refresh_diff()
 
+    def show_detail(self, row: int):
+        if not 0 <= row < len(self.changes):
+            self.detail.setText("")
+            return
+        c = self.changes[row]
+        rule = ""
+        if c.get("rule"):
+            rules = self.current_rules()
+            rule = f" – Regel: {rules[c['rule'] - 1]}" if c["rule"] <= len(rules) else ""
+        reason = f" – Begründung: {c['reason']}" if c.get("reason") else ""
+        self.detail.setText(f"{c.get('file', '')} · Zeile {c.get('line', '?')} · {c['kind']}{rule}{reason}")
+
+    def focus_change(self, row: int):
+        """Scroll the diff to a proposal and highlight it (switching to its file if needed)."""
+        if not 0 <= row < len(self.changes):
+            return
+        self.focus, self.shown_fid = row, self.changes[row]["fid"]
+        self.list.setCurrentRow(row)
+        self.refresh_diff()
+        self.diff.scrollToAnchor(f"c{row}")
+
     def refresh_diff(self):
-        self.diff.setHtml(core.diff_html(self.text, self.start, self.end, self.changes, self.selected()))
+        fid = self.shown_fid
+        if fid is None or fid not in self.texts:
+            self.diff_title.setText("")
+            self.diff.setHtml("")
+        else:
+            start, end = self.scopes[fid]
+            items = [(i, c) for i, c in enumerate(self.changes) if c["fid"] == fid]
+            self.diff_title.setText(f"Diff: {self.names[fid]}")
+            self.diff.setHtml(core.diff_html(self.texts[fid], start, end, items, self.selected(), self.focus))
         self.apply_button.setEnabled(bool(self.selected()))
 
     # ---------------------------------------------------------------- model
 
     def prompt_text(self) -> str:
         key, instruction = self.mode.currentData(), self.instruction.text().strip()
-        return {"smooth": prompts.SMOOTHING, "summarize": prompts.SUMMARIZE,
+        if key == "smooth":
+            return prompts.smoothing(self.current_rules())
+        return {"summarize": prompts.SUMMARIZE,
                 "code": prompts.CODING.format(instruction=instruction)}.get(key) or prompts.EDIT.format(instruction=instruction)
 
     def request(self):
@@ -247,19 +343,33 @@ class AiEditDialog(QtWidgets.QDialog):
             return
         key = self.mode.currentData()
         instruction = self.instruction.text().strip()
+        rules = self.current_rules()
         if key in ("edit", "code") and not instruction:
             QtWidgets.QMessageBox.information(self, _("AI edit"), _("Please enter an instruction."))
             return
-        self.load_text()
-        existing = []
-        if key == "code":
-            existing = [tuple(r) for r in self.app.conn.execute(
-                "select pos0, pos1 from code_text where cid=? and fid=?", (self.code.currentData(), self.fid))]
+        if key == "smooth" and not rules:
+            QtWidgets.QMessageBox.information(self, _("AI edit"), _("Please enter at least one smoothing rule."))
+            return
+        self.load_texts()
+        if not self.texts:
+            QtWidgets.QMessageBox.information(self, _("AI edit"), _("Please check at least one file."))
+            return
+        if key == "smooth":
+            core.save_rules(self.app.project_path, rules)
+        jobs = []
+        for fid, text in self.texts.items():
+            existing = []
+            if key == "code":
+                existing = [tuple(r) for r in self.app.conn.execute(
+                    "select pos0, pos1 from code_text where cid=? and fid=?", (self.code.currentData(), fid))]
+            start, end = self.scopes[fid]
+            jobs.append({"fid": fid, "name": self.names[fid], "text": text, "start": start, "end": end,
+                         "existing": existing})
         self.request_button.setEnabled(False)
         self.summary.setText(_("Asking the local model …"))
-        worker = Worker(propose, self.app, key, instruction, self.text, self.start, self.end, existing)
+        worker = Worker(propose, self.app, key, instruction, jobs, rules)
         worker.signals.progress.connect(lambda msg: self.summary.setText(_("Asking the local model …") + " " + msg))
-        worker.signals.result.connect(self.show_changes)
+        worker.signals.result.connect(self.show_result)
         worker.signals.error.connect(lambda _t, value, _tb: self.summary.setText(f"Fehler: {value}"))
         worker.signals.finished.connect(lambda: self.request_button.setEnabled(True))
         QtCore.QThreadPool.globalInstance().start(worker)
@@ -267,32 +377,44 @@ class AiEditDialog(QtWidgets.QDialog):
     # ---------------------------------------------------------------- apply
 
     def apply(self):
-        chosen = [c for i, c in enumerate(self.changes) if i in self.selected()]
-        row = self.app.conn.execute("select fulltext, name from source where id=?", (self.fid,)).fetchone()
-        if not chosen or row is None:
+        selected = self.selected()
+        chosen = [c for i, c in enumerate(self.changes) if i in selected]
+        if not chosen:
             return
-        if (row[0] or "") != self.text:
-            QtWidgets.QMessageBox.warning(self, _("AI edit"), _(
-                "The transcript changed since the proposal was made. Please request a new proposal."))
-            return
-        question = core.summary(self.text, chosen) + "\n\n" + _(
+        by_file: dict[int, list[dict]] = {}
+        for c in chosen:
+            by_file.setdefault(c["fid"], []).append(c)
+        for fid in by_file:
+            row = self.app.conn.execute("select fulltext from source where id=?", (fid,)).fetchone()
+            if row is None or (row[0] or "") != self.texts[fid]:
+                QtWidgets.QMessageBox.warning(self, _("AI edit"), self.names[fid] + ": " + _(
+                    "The transcript changed since the proposal was made. Please request a new proposal."))
+                return
+        question = core.summary(None, chosen) + "\n\n" + _(
             "Apply these changes? A backup of the project is made first.")
         if QtWidgets.QMessageBox.question(self, _("AI edit"), question) != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         key = self.mode.currentData()
-        backup_path = core.backup(self.app.conn, self.app.project_path)
-        if key == "code":
-            apply_codings(self.app, self.fid, self.code.currentData(), chosen,
-                          f"KI-Vorschlag ({self.instruction.text().strip()})")
-        else:
-            core.save_original(self.app.project_path, self.fid, row[1], self.text)
-            apply_text_changes(self.app, self.fid, chosen)
+        try:
+            backup_path = core.backup(self.app.conn, self.app.project_path)
+        except RuntimeError as err:
+            QtWidgets.QMessageBox.warning(self, _("AI edit"), str(err))
+            return
+        model, base = current_model(self.app)
+        log = None
+        for fid, changes in by_file.items():
+            if key == "code":
+                apply_codings(self.app, fid, self.code.currentData(), changes,
+                              f"KI-Vorschlag ({self.instruction.text().strip()})")
+            else:
+                core.save_original(self.app.project_path, fid, self.names[fid], self.texts[fid])
+                apply_text_changes(self.app, fid, changes)
+            log = core.append_log(
+                self.app.project_path, file_name=self.names[fid], mode=self.mode.currentText(),
+                instruction=self.instruction.text().strip(), prompt=self.prompt_text(), model=f"{model} ({base})",
+                text=self.texts[fid], changes=changes,
+                proposed=sum(1 for c in self.changes if c["fid"] == fid), backup_path=backup_path)
         if hasattr(self.app, "delete_backup"):
             self.app.delete_backup = False
-        model, base = current_model(self.app)
-        log = core.append_log(
-            self.app.project_path, file_name=row[1], mode=self.mode.currentText(),
-            instruction=self.instruction.text().strip(), prompt=self.prompt_text(), model=f"{model} ({base})",
-            text=self.text, changes=chosen, proposed=len(self.changes), backup_path=backup_path)
-        self.load_text()
+        self.load_texts()
         self.summary.setText(_("Applied. Logged in ") + str(log))

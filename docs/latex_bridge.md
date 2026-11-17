@@ -24,29 +24,39 @@ bypasses any configured proxy.
 
 ## AI edit with diff review
 
-1. Pick the file (or start from a selection in the coding window) and a mode:
-   - **Glätten (fester Prompt)** — fixed, documented smoothing prompt (`latex_bridge/prompts.py`):
-     fillers, repetitions, light dialect normalisation, meaning unchanged, speaker labels and line
-     breaks kept.
+1. Tick one or several files (or start from a selection in the coding window) and pick a mode:
+   - **Glätten nach Regeln** — your own smoothing rules, one per line in the *Smoothing rules* box.
+     They are numbered R1, R2, … and saved with the project in `latex_bridge/glaettungsregeln.txt`
+     (a new project starts with fillers, repetitions, broken-off starts, light dialect). The prompt
+     (`latex_bridge/prompts.py`) makes the model first check every sentence against every rule
+     (`<pruefung>`), then re-check each planned change (rule? meaning unchanged? original verbatim?),
+     and only then list the changes as JSON: rule number, verbatim original, replacement, reason.
+     Fixed limits apply on top of any rule: meaning unchanged, speaker labels and line breaks kept,
+     change only what a rule asks for.
    - **Zusammenfassen**, **Eigene Anweisung** (e.g. "diese Informationen einbauen").
    - **Überall markieren (Code setzen)** — "mark everywhere X with code Y": pick code Y, describe X.
 2. *Request proposal*. Long transcripts are sent in pieces of about 4000 characters, cut at line breaks.
 3. The proposal is a diff like a pull request: removed text red and struck through, new text green,
-   codings yellow. A summary shows the number of changes, the lines and the kinds (*Füllwort
-   entfernt*, *Wiederholung entfernt*, *Satz umgestellt*, *zusammengefasst*, *Schreibweise
-   angepasst*, *ergänzt*, *geändert*, *Code gesetzt*).
+   codings yellow. Every smoothing change carries the badge of its rule (R1, R2, …); the list on the
+   left shows file, line, rule and the change, the summary counts the changes per rule.
+   - **Single click** on a proposal shows its file, line, full rule text and the model's reason below
+     the diff. **Double-click** scrolls the diff to it and highlights it (switching to its file).
+   - A change the model could not tie to one of your rules is marked **⚠ keine Regel** and starts
+     unticked. Changes whose original is not in the text, that overlap another change or that would
+     touch a line break are dropped; the summary says how many.
 4. Untick what you reject, *Select all* / *Select none*, or *Request proposal* again.
 5. *Apply selected* asks once more, then:
-   - backs up the project database (`latex_bridge/backups/data_<time>.qda`, SQLite backup API);
-   - keeps the original transcript once (`latex_bridge/originale/<id>_<name>.txt`, never overwritten);
+   - backs up the project database once (`latex_bridge/backups/data_<time>.qda`, SQLite backup API);
+     if another QualCoder window still holds unsaved changes, it stops and says so instead;
+   - keeps each original transcript once (`latex_bridge/originale/<id>_<name>.txt`, never overwritten);
    - applies text changes **through QualCoder's own edit dialog** (`DialogEditTextFile`), one delete
      and one insert at a time, so codings, annotations and case links move with the text exactly as
      with a manual edit; codings are inserted through QualCoder's database connection;
-   - appends to `latex_bridge/ki_protokoll.md`: time, mode, instruction, full prompt, model and
-     address, accepted vs. proposed changes, and the diff. This file documents the smoothing rules for
-     the thesis.
+   - appends one entry per file to `latex_bridge/ki_protokoll.md`: time, mode, instruction, full
+     prompt including the numbered rules, model and address, accepted vs. proposed changes, and the
+     diff with rule and reason per change. This file documents the smoothing rules for the thesis.
 
-Nothing is written before *Apply*. If the transcript changed in the meantime, applying is refused.
+Nothing is written before *Apply*. If a transcript changed in the meantime, applying is refused.
 
 ### Local model (llama.cpp / Gemma, or Ollama)
 
@@ -119,11 +129,17 @@ fork and the new module stay under LGPL-3.0, with the upstream copyright notices
 
 ## Tests
 
-`tests/test_latex_bridge.py`, 16 tests: selection → coding, drag payload and HTML escaping,
-loopback-only status check, heartbeat, diff and classification, chunking, quote parsing, backup,
-original copy, log, and with Qt offscreen: QualCoder's edit dialog moves codings correctly, the
-a coding that ends with the text survives an edit, the dialog's propose → apply → backup → log path, coding mode with a rejected proposal, a remote model is
-refused, drag data through the patched virtual, the reference menu, and the main-window hook.
+`tests/test_latex_bridge.py`, 21 tests.
+
+- Without Qt: selection → coding, drag payload and HTML escaping, loopback-only status check,
+  heartbeat, diff and classification, chunking, quote parsing, own rules (load, save, numbering,
+  prompt), parsing the model's edits, locating them with rule, reason and guards, backup, original
+  copy, log.
+- With Qt offscreen: QualCoder's edit dialog moves codings correctly, a coding that ends with the text
+  survives an edit, smoothing by rule → apply → backup → log, several files with double-click focus
+  and detail, refusal while another window has unsaved changes, coding mode with a rejected proposal,
+  a remote model is refused, drag data through the patched virtual, the reference menu, the
+  main-window hook.
 
 ## Known limits
 

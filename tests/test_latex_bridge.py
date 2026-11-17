@@ -112,10 +112,51 @@ class CoreTest(unittest.TestCase):
 
     def test_diff_html_marks_and_escapes(self):
         changes = core.diff_changes("a <b> c", "a c")
-        markup = core.diff_html("a <b> c", 0, 7, changes, {0})
+        markup = core.diff_html("a <b> c", 0, 7, list(enumerate(changes)), {0}, focus=1)
         self.assertIn("line-through", markup)
         self.assertIn("&lt;", markup)
         self.assertNotIn("<b>", markup)
+        self.assertIn('<a name="c1"></a>', markup)
+        self.assertIn("font-weight:bold", markup)
+
+    def test_rules_are_the_projects_and_numbered_by_us(self):
+        self.assertEqual(core.load_rules(self.tmp, ["Standard"]), ["Standard"])
+        core.save_rules(self.tmp, ["Füllwörter weg", "Dialekt glätten"])
+        self.assertEqual(core.load_rules(self.tmp, ["Standard"]), ["Füllwörter weg", "Dialekt glätten"])
+        self.assertEqual(core.parse_rules("1. Füllwörter\n\nR2: Wiederholungen\n3) Dialekt\n2026 als Zahl"),
+                         ["Füllwörter", "Wiederholungen", "Dialekt", "2026 als Zahl"])
+        prompt = prompts.smoothing(["Füllwörter weg", "Dialekt glätten"])
+        self.assertIn("R1: Füllwörter weg\nR2: Dialekt glätten", prompt)
+        self.assertIn("<pruefung>", prompt)
+        self.assertIn("Zeilenumbrüche bleiben unverändert", prompt)
+
+    def test_parse_edits_reads_the_tagged_array_and_survives_almost_json(self):
+        answer = ('<pruefung>Satz 1 [I:] ok. Satz 2: R1 "äh"</pruefung>\n<aenderungen>\n'
+                  '[{"regel": "R1", "original": "äh", "ersetzung": "", "begruendung": "Laut"},'
+                  ' {"regel": 2, "original": "", "ersetzung": "x"}, "kaputt"]\n</aenderungen>')
+        self.assertEqual(core.parse_edits(answer), [{"rule": 1, "original": "äh", "new": "", "reason": "Laut"}])
+        self.assertEqual(len(core.parse_edits('```json\n[{"regel": 2, "original": "sehr sehr", "ersetzung": "sehr",}]\n```')), 1)
+        self.assertEqual(core.parse_edits("Ich habe nichts gefunden."), [])
+
+    def test_rule_changes_locate_tag_and_guard(self):
+        text = "B1: Also äh das war äh halt sehr sehr anstrengend.\nI: Und?"
+        rules = ["Füllwörter entfernen", "Wiederholungen entfernen"]
+        edits = [{"rule": 1, "original": "äh", "new": "", "reason": "a"},
+                 {"rule": 1, "original": "äh halt", "new": "", "reason": "b"},
+                 {"rule": 2, "original": "sehr sehr", "new": "sehr", "reason": "c"},
+                 {"rule": 9, "original": "anstrengend", "new": "hart", "reason": "d"},
+                 {"rule": 2, "original": "sehr", "new": "", "reason": "überschneidet"},
+                 {"rule": 1, "original": "anstrengend.\nI:", "new": "anstrengend. I:", "reason": "Zeile"},
+                 {"rule": 1, "original": "fehlt", "new": "", "reason": "e"}]
+        changes, dropped = core.rule_changes(text, edits, 0, len(text), rules)
+        self.assertEqual(dropped, 3)
+        self.assertEqual([c["kind"] for c in changes],
+                         ["R1 Füllwörter entfernen", "R1 Füllwörter entfernen", "R2 Wiederholungen entfernen", core.NO_RULE])
+        result = text
+        for c in sorted(changes[:3], key=lambda c: c["pos0"], reverse=True):
+            result = result[:c["pos0"]] + c["new"] + result[c["pos1"]:]
+        self.assertEqual(result, "B1: Also das war sehr anstrengend.\nI: Und?")
+        self.assertEqual(changes[2]["reason"], "c")
 
 
 YES = QtWidgets.QMessageBox.StandardButton.Yes
@@ -175,20 +216,87 @@ class QtTest(unittest.TestCase):
         ai_edit.apply_text_changes(self.app, 1, core.diff_changes(TEXT, revised))
         self.assertEqual(self.codings()[3][2], revised[-10:])
 
-    def test_dialog_proposes_applies_backs_up_and_logs(self):
-        smoothed = "I: Wie war das?\nB1: Das war sehr anstrengend.\nWir hatten Zeitdruck."
-        self.app.ai = SimpleNamespace(invoke_with_logging=lambda messages, context: SimpleNamespace(content=smoothed))
+    SMOOTH_ANSWER = (
+        "<pruefung>Satz 2: R1 äh, halt; R2 sehr sehr</pruefung><aenderungen>["
+        '{"regel": 1, "original": "äh", "ersetzung": "", "begruendung": "Verzögerungslaut"},'
+        '{"regel": 1, "original": "halt", "ersetzung": "", "begruendung": "Füllwort"},'
+        '{"regel": 2, "original": "sehr sehr", "ersetzung": "sehr", "begruendung": "Wiederholung"},'
+        '{"regel": 7, "original": "Zeitdruck", "ersetzung": "Stress", "begruendung": "?"},'
+        '{"regel": 1, "original": "gibt es nicht", "ersetzung": ""}]</aenderungen>')
+
+    def jobs(self, dialog):
+        return [{"fid": fid, "name": dialog.names[fid], "text": dialog.texts[fid], "start": dialog.scopes[fid][0],
+                 "end": dialog.scopes[fid][1], "existing": []} for fid in dialog.texts]
+
+    def test_dialog_smooths_by_rule_applies_backs_up_and_logs(self):
+        self.app.ai = SimpleNamespace(invoke_with_logging=lambda messages, context: SimpleNamespace(
+            content=self.SMOOTH_ANSWER))
         dialog = ai_edit.AiEditDialog(self.app, 1)
-        dialog.show_changes(ai_edit.propose(self.app, "smooth", "", dialog.text, dialog.start, dialog.end, []))
-        self.assertIn("Füllwort entfernt", dialog.summary.text())
+        dialog.show_result(ai_edit.propose(self.app, "smooth", "", self.jobs(dialog), dialog.current_rules()))
+        self.assertIn("R1 Füllwörter und", dialog.summary.text())
+        self.assertIn("1 Vorschläge des Modells verworfen", dialog.summary.text())
+        unchecked = [dialog.list.item(i).text() for i in range(dialog.list.count())
+                     if dialog.list.item(i).checkState() == QtCore.Qt.CheckState.Unchecked]
+        self.assertEqual(len(unchecked), 1)
+        self.assertIn(core.NO_RULE, unchecked[0])
+        self.assertIn("vertical-align:super;\">R2<", dialog.diff.toHtml())  # rule badge
         with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=YES):
             dialog.apply()
-        self.assertEqual(self.app.conn.execute("select fulltext from source").fetchone()[0], smoothed)
+        smoothed = "I: Wie war das?\nB1: Also das war sehr anstrengend.\nWir hatten Zeitdruck."
+        self.assertEqual(self.app.conn.execute("select fulltext from source where id=1").fetchone()[0], smoothed)
+        for _ctid, (pos0, pos1, seltext) in self.codings().items():
+            self.assertEqual(smoothed[pos0:pos1], seltext)
         folder = Path(self.tmp, "latex_bridge")
         self.assertEqual(len(list((folder / "backups").glob("data_*.qda"))), 1)
         self.assertEqual((folder / "originale" / "1_Interview_1.txt.txt").read_text(), TEXT)
-        self.assertIn("gemma-4 (http://localhost:8081/v1/)", (folder / "ki_protokoll.md").read_text())
+        log = (folder / "ki_protokoll.md").read_text()
+        self.assertIn("gemma-4 (http://localhost:8081/v1/)", log)
+        self.assertIn("R1: Füllwörter und Verzögerungslaute", log)  # the rules are in the logged prompt
+        self.assertIn("# Begründung: Wiederholung", log)
         self.assertFalse(self.app.delete_backup)
+
+    def test_several_files_at_once_with_focus_and_detail(self):
+        second = "B2: Ich ich weiß nich.\nI: Danke."
+        self.app.conn.execute("insert into source (id, name, fulltext) values (2, 'Interview 2.txt', ?)", (second,))
+        self.app.conn.commit()
+        answers = {TEXT: self.SMOOTH_ANSWER, second: '<aenderungen>[{"regel": 2, "original": "Ich ich", '
+                   '"ersetzung": "Ich", "begruendung": "Stottern"}, {"regel": 4, "original": "nich", '
+                   '"ersetzung": "nicht", "begruendung": "Umgangssprache"}]</aenderungen>'}
+        self.app.ai = SimpleNamespace(invoke_with_logging=lambda messages, context: SimpleNamespace(
+            content=answers[messages[1][1]]))
+        dialog = ai_edit.AiEditDialog(self.app)
+        for i in range(dialog.files.count()):
+            dialog.files.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+        self.assertEqual(sorted(dialog.texts), [1, 2])
+        dialog.show_result(ai_edit.propose(self.app, "smooth", "", self.jobs(dialog), dialog.current_rules()))
+        self.assertIn("2 Dateien", dialog.summary.text())
+        last = dialog.list.count() - 1
+        self.assertIn("Interview 2.txt", dialog.list.item(last).text())
+        dialog.focus_change(last)
+        self.assertEqual(dialog.diff_title.text(), "Diff: Interview 2.txt")
+        self.assertIn("font-weight:700; background-color:#69f0ae;\">nicht<", dialog.diff.toHtml())  # focused
+        self.assertIn("Begründung: Umgangssprache", dialog.detail.text())
+        self.assertIn("Regel: Dialekt und Umgangssprache", dialog.detail.text())
+        with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=YES):
+            dialog.apply()
+        texts = dict(self.app.conn.execute("select id, fulltext from source"))
+        self.assertEqual(texts[2], "B2: Ich weiß nicht.\nI: Danke.")
+        self.assertIn("B1: Also das war sehr anstrengend.", texts[1])
+        log = Path(self.tmp, "latex_bridge", "ki_protokoll.md").read_text()
+        self.assertEqual(log.count("\n## "), 2)
+
+    def test_unsaved_changes_elsewhere_refuse_instead_of_hanging(self):
+        self.app.ai = SimpleNamespace(invoke_with_logging=lambda messages, context: SimpleNamespace(
+            content=self.SMOOTH_ANSWER))
+        dialog = ai_edit.AiEditDialog(self.app, 1)
+        dialog.show_result(ai_edit.propose(self.app, "smooth", "", self.jobs(dialog), dialog.current_rules()))
+        self.app.conn.execute("update code_name set name='offen' where cid=1")  # another window, not committed
+        with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=YES), \
+                mock.patch.object(QtWidgets.QMessageBox, "warning") as warning:
+            dialog.apply()
+        self.assertIn("nicht gespeicherte Änderungen", warning.call_args[0][2])
+        self.assertEqual(self.app.conn.execute("select fulltext from source where id=1").fetchone()[0], TEXT)
+        self.app.conn.rollback()
 
     def test_coding_mode_inserts_after_confirmation(self):
         self.app.ai = SimpleNamespace(invoke_with_logging=lambda messages, context: SimpleNamespace(
@@ -197,7 +305,7 @@ class QtTest(unittest.TestCase):
         dialog.mode.setCurrentIndex(dialog.mode.findData("code"))
         dialog.code.setCurrentIndex(dialog.code.findData(2))
         dialog.instruction.setText("Zeitdruck")
-        dialog.show_changes(ai_edit.propose(self.app, "code", "Zeitdruck", dialog.text, 0, len(dialog.text), []))
+        dialog.show_result(ai_edit.propose(self.app, "code", "Zeitdruck", self.jobs(dialog), []))
         rejected = dialog.list.findItems("Wie war das?", QtCore.Qt.MatchFlag.MatchContains)[0]
         rejected.setCheckState(QtCore.Qt.CheckState.Unchecked)
         with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=YES):

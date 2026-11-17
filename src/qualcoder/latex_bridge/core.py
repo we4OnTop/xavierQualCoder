@@ -33,6 +33,8 @@ FILLERS = {
     "irgendwie", "naja", "na", "ne", "gell", "also", "ja", "genau", "so", "eigentlich", "einfach",
 }
 CODE_SET = "Code gesetzt"
+NO_RULE = "⚠ keine Regel"
+RULES_FILE = "glaettungsregeln.txt"
 
 
 # ---------------------------------------------------------------- LaTeX editor link
@@ -210,35 +212,130 @@ def coding_changes(text: str, quotes: list[str], start: int, end: int, existing:
     ]
 
 
-def summary(text: str, changes: list[dict]) -> str:
+def parse_rules(text: str) -> list[str]:
+    """One rule per line; a leading "1." or "R1:" is dropped, since the numbering is ours."""
+    return [re.sub(r"^\s*(?:R?\d+\s*[.:)]\s*)", "", line).strip() for line in text.splitlines() if line.strip()]
+
+
+def load_rules(project_path: str, default: list[str]) -> list[str]:
+    try:
+        rules = parse_rules(Path(project_path, FOLDER, RULES_FILE).read_text(encoding="utf-8"))
+    except OSError:
+        rules = []
+    return rules or list(default)
+
+
+def save_rules(project_path: str, rules: list[str]) -> None:
+    (project_folder(project_path) / RULES_FILE).write_text("\n".join(rules) + "\n", encoding="utf-8")
+
+
+def parse_edits(answer: str) -> list[dict]:
+    """The edits of a smoothing answer: the JSON array between <aenderungen> tags (or the array left
+    after removing the <pruefung> part). Malformed entries are skipped."""
+    tagged = re.search(r"<aenderungen>(.*?)(?:</aenderungen>|$)", answer, re.S)
+    body = tagged.group(1) if tagged else re.sub(r"<pruefung>.*?</pruefung>", "", answer, flags=re.S)
+    start, end = body.find("["), body.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        items = json.loads(body[start:end + 1])
+    except ValueError:
+        try:  # local models often produce almost-JSON; json_repair is already a QualCoder dependency
+            import json_repair
+            items = json_repair.loads(body[start:end + 1])
+        except Exception:
+            return []
+    edits = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("original"), str) or not item["original"].strip():
+            continue
+        rule = re.search(r"\d+", str(item.get("regel", "")))
+        edits.append({"rule": int(rule.group()) if rule else 0, "original": item["original"],
+                      "new": str(item.get("ersetzung") or ""), "reason": str(item.get("begruendung") or "").strip()})
+    return edits
+
+
+def short_rule(rule: str) -> str:
+    return rule if len(rule) <= 32 else rule[:30].rsplit(" ", 1)[0] + " …"
+
+
+def rule_changes(text: str, edits: list[dict], start: int, end: int, rules: list[str]) -> tuple[list[dict], int]:
+    """(changes, dropped) for the model's edits inside [start, end).
+
+    Each original is searched from the previous edit on (models list them in text order), tolerant to
+    whitespace. Dropped: not found, overlapping an earlier edit, no change, or touching a line break."""
+    changes, taken, cursor, dropped = [], [], start, 0
+    for edit in edits:
+        pattern = re.compile(r"\s+".join(re.escape(w) for w in edit["original"].split()))
+        match = pattern.search(text, cursor, end) or pattern.search(text, start, end)
+        if not match:
+            dropped += 1
+            continue
+        p0, p1 = match.span()
+        new = edit["new"]
+        if not new.strip():  # a removal takes one neighbouring space with it, so no double space remains
+            new = ""
+            if p1 < end and text[p1] == " " and (p0 == start or text[p0 - 1] in " \n"):
+                p1 += 1
+            elif p0 > start and text[p0 - 1] == " " and (p1 == end or text[p1] in ",.;:!?\n"):
+                p0 -= 1
+        if new == text[p0:p1] or text[p0:p1].count("\n") != new.count("\n") \
+                or any(p0 < b and a < p1 for a, b in taken):
+            dropped += 1
+            continue
+        taken.append((p0, p1))
+        cursor = p1
+        valid = 1 <= edit["rule"] <= len(rules)
+        changes.append({
+            "pos0": p0, "pos1": p1, "old": text[p0:p1], "new": new, "rule": edit["rule"] if valid else 0,
+            "kind": f"R{edit['rule']} {short_rule(rules[edit['rule'] - 1])}" if valid else NO_RULE,
+            "reason": edit["reason"],
+        })
+    return sorted(changes, key=lambda c: c["pos0"]), dropped
+
+
+def summary(text: str | None, changes: list[dict]) -> str:
+    """"12 Änderungen · Zeilen 3–40 · R1 …: 7, R2 …: 5"; over several files the file count instead of lines."""
     if not changes:
         return "Keine Änderungen vorgeschlagen."
     kinds = {}
     for c in changes:
         kinds[c["kind"]] = kinds.get(c["kind"], 0) + 1
-    first, last = line_of(text, changes[0]["pos0"]), line_of(text, changes[-1]["pos1"])
-    lines = f"Zeile {first}" if first == last else f"Zeilen {first}–{last}"
-    return f"{len(changes)} Änderungen · {lines} · " + ", ".join(f"{k}: {n}" for k, n in sorted(kinds.items()))
+    files = {c["file"] for c in changes if c.get("file")}
+    lines = sorted(c.get("line") or line_of(text or "", c["pos0"]) for c in changes)
+    where = f"{len(files)} Dateien" if len(files) > 1 else \
+        f"Zeile {lines[0]}" if lines[0] == lines[-1] else f"Zeilen {lines[0]}–{lines[-1]}"
+    return f"{len(changes)} Änderungen · {where} · " + ", ".join(f"{k}: {n}" for k, n in sorted(kinds.items()))
 
 
-def diff_html(text: str, start: int, end: int, changes: list[dict], selected: set[int]) -> str:
+def diff_html(text: str, start: int, end: int, items: list[tuple[int, dict]], selected: set[int],
+              focus: int | None = None) -> str:
     """Inline diff like a pull request: removed red and struck through, added green, codings yellow.
 
-    Rejected (unchecked) changes are shown greyed out."""
+    items are (index, change) of one file; every change gets the anchor c<index> to scroll to and,
+    for smoothing, the badge of its rule (R2, or a red ? without a valid rule). Unchecked changes are
+    greyed out; the focused one is bold and stronger in colour."""
     out, pos = [], start
-    for index, c in enumerate(changes):
+    for index, c in items:
         out.append(html.escape(text[pos:c["pos0"]]))
-        on = index in selected
+        on, hot = index in selected, index == focus
+        bold = "font-weight:bold;" if hot else ""
+        grey = "" if on or hot else "color:#9e9e9e;"
+        out.append(f'<a name="c{index}"></a>')
         if c["kind"] == CODE_SET:
-            style = "background:#ffe9a8;" if on else "background:#eee;"
-            out.append(f'<span style="{style}">{html.escape(c["old"])}</span>')
+            background = "#ffb300" if hot else "#ffe9a8" if on else "#eeeeee"
+            out.append(f'<span style="background:{background};{bold}">{html.escape(c["old"])}</span>')
         else:
-            dim = "" if on else "opacity:0.45;"
             if c["old"]:
-                removed = "background:#ffd7d5;text-decoration:line-through;" + dim
-                out.append(f'<span style="{removed}">{html.escape(c["old"])}</span>')
+                background = "#ff8a80" if hot else "#ffd7d5"
+                out.append(f'<span style="background:{background};text-decoration:line-through;{grey}{bold}">'
+                           f'{html.escape(c["old"])}</span>')
             if c["new"]:
-                out.append(f'<span style="background:#ccffd8;{dim}">{html.escape(c["new"])}</span>')
+                background = "#69f0ae" if hot else "#ccffd8"
+                out.append(f'<span style="background:{background};{grey}{bold}">{html.escape(c["new"])}</span>')
+        if "rule" in c:
+            badge = f'R{c["rule"]}' if c["rule"] else "?"
+            out.append(f'<sup style="color:{"#1565c0" if c["rule"] else "#c62828"};{bold}">{badge}</sup>')
         pos = c["pos1"]
     out.append(html.escape(text[pos:end]))
     return '<div style="white-space:pre-wrap;font-family:sans-serif">' + "".join(out) + "</div>"
@@ -259,6 +356,10 @@ def stamp() -> str:
 
 def backup(conn: sqlite3.Connection, project_path: str) -> Path:
     """A consistent copy of the open project database, taken through SQLite's backup API."""
+    if conn.in_transaction:
+        # sqlite3's backup retries forever while the same connection holds an open write transaction.
+        raise RuntimeError("Ein anderes QualCoder-Fenster hat noch nicht gespeicherte Änderungen. Bitte dort "
+                           "speichern oder das Fenster schließen und dann erneut übernehmen.")
     target = project_folder(project_path, "backups") / f"data_{stamp()}.qda"
     copy = sqlite3.connect(target)
     try:
@@ -291,7 +392,9 @@ def append_log(project_path: str, *, file_name: str, mode: str, instruction: str
         "```diff",
     ]
     for c in changes:
-        lines.append(f"@@ Zeile {line_of(text, c['pos0'])} · {c['kind']}")
+        lines.append(f"@@ Zeile {c.get('line') or line_of(text, c['pos0'])} · {c['kind']}")
+        if c.get("reason"):
+            lines.append(f"# Begründung: {c['reason']}")
         if c["kind"] == CODE_SET:
             lines.append("+ [Code] " + c["old"].replace("\n", " "))
             continue
