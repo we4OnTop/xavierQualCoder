@@ -74,6 +74,7 @@ from qualcoder.ai_runtime import (
     vectorstore_required,
 )
 from qualcoder.error_dlg import qt_exception_hook
+from qualcoder import latex_bridge
 from qualcoder.external_mcp import ExternalMcpController
 from qualcoder.attributes import DialogManageAttributes
 from qualcoder.cases import DialogCases
@@ -348,6 +349,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.tabWidget.setDocumentMode(True)
         self.init_action_log()
         self.init_placeholder_tab_layouts()
+        latex_bridge.install_main(self)  # fork: link to the LaTeX editor, see docs/latex_bridge.md
         # Keep platform menu integration consistent across themes.
         self.ui.menubar.setNativeMenuBar(True)
         self.ui.textEdit.append(

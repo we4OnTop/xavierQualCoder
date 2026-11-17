@@ -625,7 +625,7 @@ class DialogEditTextFile(QtWidgets.QDialog):
         for c in self.casetext:
             if c['newpos0'] is not None:
                 cur.execute(sql, [c['newpos0'], c['newpos1'], c['id'], c['newpos0'], c['newpos1']])
-            if c['newpos1'] >= len(self.text):
+            if c['newpos1'] > len(self.text):  # fork: pos1 is exclusive; == len(text) is a coding to the end
                 cur.execute("delete from case_text where id=?", [c['id']])
 
     def update_annotations(self):
@@ -636,7 +636,7 @@ class DialogEditTextFile(QtWidgets.QDialog):
         for a in self.annotations:
             if a['newpos0'] is not None:
                 cur.execute(sql, [a['newpos0'], a['newpos1'], a['anid'], a['newpos0'], a['newpos1']])
-            if a['newpos1'] >= len(self.text):
+            if a['newpos1'] > len(self.text):  # fork: pos1 is exclusive
                 cur.execute("delete from annotation where anid=?", [a['anid']])
 
     def update_codings(self):
@@ -648,7 +648,7 @@ class DialogEditTextFile(QtWidgets.QDialog):
             if c['newpos0'] is not None:
                 seltext = self.text[c['newpos0']:c['newpos1']]
                 cur.execute(sql, [c['newpos0'], c['newpos1'], seltext, c['ctid']])
-            if c['newpos1'] >= len(self.text):
+            if c['newpos1'] > len(self.text):  # fork: pos1 is exclusive; == len(text) is a coding to the end
                 cur.execute("delete from code_text where ctid=?", [c['ctid']])
 
     def textedit_menu(self, position):

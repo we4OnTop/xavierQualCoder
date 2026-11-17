@@ -48,6 +48,7 @@ from .ai_agent_prompts import AiAgentPromptsCatalog, prompt_name_and_scope
 from .ai_runtime import AI_READY, ensure_ai_ready
 from .ai_ui import ai_chat_signal_emitter
 from .code_in_all_files import DialogCodeInAllFiles
+from . import latex_bridge
 from .code_text_coding_margin import (CodingMargin, DEFAULT_CODING_MARGIN_WIDTH, MINIMUM_CODING_MARGIN_WIDTH,
                                       MINIMUM_CODING_MARGIN_LABEL_WIDTH)
 from .code_tree import CodeTreeController
@@ -223,6 +224,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.event_filter_installed = True
         self.ui.plainTextEdit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.plainTextEdit.customContextMenuRequested.connect(self.text_edit_menu)
+        latex_bridge.install_code_text(self)  # fork: drag carries the coding, docs/latex_bridge.md
         self.ui.plainTextEdit.cursorPositionChanged.connect(self.overlapping_codes_in_text)
         self.ui.plainTextEdit.verticalScrollBar().valueChanged.connect(self.hide_resize_handles)
 
@@ -2194,6 +2196,7 @@ class DialogCodeText(QtWidgets.QWidget):
         if not self.ui.groupBox.isHidden():
             action_hide_top_groupbox = menu.addAction(_("Hide control panel (H)"))
         action_tooltips = menu.addAction(_("Toggle tooltips"))
+        latex_bridge.add_text_menu_actions(self, menu, position)  # fork: docs/latex_bridge.md
         action = menu.exec(self.ui.plainTextEdit.mapToGlobal(position))
         if action is None:
             return
